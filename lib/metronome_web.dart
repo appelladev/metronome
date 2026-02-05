@@ -29,6 +29,7 @@ class MetronomeWeb extends MetronomePlatform {
   bool _isPlaying = false;
   int _currentTick = 0;
   int _bpm = 120;
+  int? _pendingBpm;
   int _timeSignature = 4;
   double _volume = 1.0;
   bool _enableTickCallback = false;
@@ -128,7 +129,11 @@ class MetronomeWeb extends MetronomePlatform {
   @override
   Future<void> setBPM(int bpm) async {
     if (bpm != _bpm) {
-      _bpm = bpm;
+      if (_isPlaying) {
+        _pendingBpm = bpm;
+      } else {
+        _bpm = bpm;
+      }
     }
   }
 
@@ -173,6 +178,10 @@ class MetronomeWeb extends MetronomePlatform {
   void _schedule() {
     web.window.clearTimeout(_scheduleTimer);
     while (_nextBeatTime < _audioContext!.currentTime + _lookahead) {
+      if (_pendingBpm != null) {
+        _bpm = _pendingBpm!;
+        _pendingBpm = null;
+      }
       _scheduleBeat(_nextBeatTime);
       _nextBeatTime += 60.0 / _bpm;
     }
@@ -183,8 +192,8 @@ class MetronomeWeb extends MetronomePlatform {
   }
 
   void _scheduleBeat(double time) {
-    final tickToPlay = _currentTick;
-    final isAccented = (tickToPlay % _timeSignature) == 0;
+    final tickToPlay = _timeSignature > 1 ? _currentTick : 0;
+    final isAccented = (_timeSignature > 1) && (tickToPlay == 0);
     final buffer = isAccented ? _accentedSoundBuffer : _mainSoundBuffer;
     final source = _audioContext!.createBufferSource();
     source.buffer = buffer;
@@ -194,7 +203,6 @@ class MetronomeWeb extends MetronomePlatform {
     gainNode.connect(_audioContext!.destination);
     source.start(time);
     _scheduleTickCallback(tickToPlay: tickToPlay, scheduledTime: time);
-    _currentTick = (tickToPlay + 1) % _timeSignature;
     source.onEnded.listen((_) {
       if (_mainSoundBufferTemp != null) {
         _mainSoundBuffer = _mainSoundBufferTemp;
@@ -205,6 +213,9 @@ class MetronomeWeb extends MetronomePlatform {
         _accentedSoundBufferTemp = null;
       }
     });
+    _currentTick = (_timeSignature > 1)
+        ? (_currentTick + 1) % _timeSignature
+        : 0;
   }
 
   void _scheduleTickCallback({

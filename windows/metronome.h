@@ -43,6 +43,7 @@ private:
     void InitializeAudio();
     void OnBufferDone();
     void PlaySound();
+    void ApplyPendingBpmIfNeeded();
     std::shared_ptr<flutter::EventSink<flutter::EncodableValue>> eventTickSink;
     std::vector<int16_t> Metronome::byteArrayToShortArray(const std::vector<uint8_t> &byteArray);
     std::vector<int16_t> Metronome::generateBuffer();
@@ -62,6 +63,7 @@ private:
     int sampleRate = 44100;
     int beatLength = 0;
     double audioVolume = 1.0;
+    std::atomic<int> pendingBpm{0};
     std::atomic<bool> playing{false};
     std::thread metronomeThread;
 };
