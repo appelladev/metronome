@@ -12,6 +12,9 @@ import android.media.AudioAttributes;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
+import android.os.Handler;
+import android.os.Looper;
 import io.flutter.plugin.common.EventChannel;
 
 public class Metronome {
@@ -24,8 +27,10 @@ public class Metronome {
     public int audioTimeSignature;
     public float audioVolume;
     private final AtomicInteger pendingBpm = new AtomicInteger(0);
+    private final AtomicBoolean isRunning = new AtomicBoolean(false);
     private EventChannel.EventSink eventTickSink;
     private int currentTick = 0;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     @SuppressWarnings("deprecation")
     public Metronome(byte[] mainFileBytes, byte[] accentedFileBytes, int bpm, int timeSignature, float volume,
@@ -65,18 +70,21 @@ public class Metronome {
     }
 
     public void play() {
-        if (!isPlaying()) {
+        if (!isRunning.get()) {
             currentTick = 0;
+            isRunning.set(true);
             audioTrack.play();
             startMetronome();
         }
     }
 
     public void pause() {
+        isRunning.set(false);
         audioTrack.pause();
     }
 
     public void stop() {
+        isRunning.set(false);
         audioTrack.flush();
         audioTrack.stop();
         currentTick = 0;
@@ -155,10 +163,14 @@ public class Metronome {
 
     private void startMetronome() {
         new Thread(() -> {
-            while (isPlaying()) {
+            while (isRunning.get()) {
                 synchronized (mLock) {
                     if (!isPlaying()) {
-                        return;
+                        try {
+                            Thread.sleep(1);
+                        } catch (InterruptedException ignored) {
+                        }
+                        continue;
                     }
                     int nextBpm = pendingBpm.getAndSet(0);
                     if (nextBpm > 0 && nextBpm != audioBpm) {
@@ -167,7 +179,13 @@ public class Metronome {
                     int tickToPlay = (audioTimeSignature < 2) ? 0 : currentTick;
                     short[] buffer = generateBeatBuffer(tickToPlay);
                     if (eventTickSink != null) {
-                        eventTickSink.success(tickToPlay);
+                        mainHandler.post(() -> {
+                            try {
+                                eventTickSink.success(tickToPlay);
+                            } catch (Exception ignored) {
+                                // Avoid crashing audio thread on event channel errors.
+                            }
+                        });
                     }
                     audioTrack.write(buffer, 0, buffer.length);
                     if (audioTimeSignature < 2) {

@@ -79,12 +79,16 @@ class Metronome {
                 return
             }
         }
+        if isScheduling { return }
+        currentTick = 0
+        prepareBeatBuffers()
+        isScheduling = true
         if !audioPlayerNode.isPlaying {
             audioPlayerNode.play()
         }
-        currentTick = 0
-        prepareBeatBuffers()
-        startScheduler()
+        schedulingQueue.async { [weak self] in
+            self?.scheduleNextBeat()
+        }
     }
 
     /// Pause the metronome.
@@ -94,6 +98,7 @@ class Metronome {
     
     /// Stop the metronome.
     func stop() {
+        isScheduling = false
         audioPlayerNode.stop()
         stopScheduler()
         currentTick = 0
@@ -241,7 +246,7 @@ class Metronome {
     }
 
     private func scheduleNextBeat() {
-        guard isScheduling, audioPlayerNode.isPlaying else { return }
+        guard isScheduling else { return }
 
         if let pending = pendingBpm {
             audioBpm = pending
