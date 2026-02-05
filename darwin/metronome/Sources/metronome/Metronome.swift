@@ -15,10 +15,8 @@ class Metronome {
     private var sampleRate: Int = 44100
     private var beatBufferMain: AVAudioPCMBuffer?
     private var beatBufferAccented: AVAudioPCMBuffer?
-    private var scheduleTimer: DispatchSourceTimer?
-    private let lookahead: TimeInterval = 0.1
-    private let scheduleInterval: TimeInterval = 0.05
-    private var nextBeatSampleTime: AVAudioFramePosition = 0
+    private let schedulingQueue = DispatchQueue(label: "metronome.scheduler")
+    private var isScheduling: Bool = false
     private var currentTick: Int = 0
     private var pendingBpm: Int?
     /// Initialize the metronome with the main and accented audio files.
@@ -98,7 +96,6 @@ class Metronome {
     func stop() {
         audioPlayerNode.stop()
         stopScheduler()
-        nextBeatSampleTime = 0
         currentTick = 0
     }
     
@@ -232,70 +229,47 @@ class Metronome {
     }
 
     private func startScheduler() {
-        if scheduleTimer != nil { return }
-        if let currentSampleTime = currentPlayerSampleTime() {
-            nextBeatSampleTime = currentSampleTime
-        } else {
-            nextBeatSampleTime = 0
+        if isScheduling { return }
+        isScheduling = true
+        schedulingQueue.async { [weak self] in
+            self?.scheduleNextBeat()
         }
-        scheduleTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
-        scheduleTimer?.schedule(deadline: .now(), repeating: scheduleInterval, leeway: .milliseconds(5))
-        scheduleTimer?.setEventHandler { [weak self] in
-            self?.scheduleBeats()
-        }
-        scheduleTimer?.resume()
     }
 
     private func stopScheduler() {
-        if scheduleTimer != nil {
-            scheduleTimer?.cancel()
-            scheduleTimer = nil
-        }
+        isScheduling = false
     }
 
-    private func scheduleBeats() {
-        guard audioPlayerNode.isPlaying else { return }
-        guard let nodeTime = audioPlayerNode.lastRenderTime,
-              let playerTime = audioPlayerNode.playerTime(forNodeTime: nodeTime) else { return }
+    private func scheduleNextBeat() {
+        guard isScheduling, audioPlayerNode.isPlaying else { return }
 
-        let currentSampleTime = playerTime.sampleTime
-        let lookaheadSamples = AVAudioFramePosition(self.lookahead * playerTime.sampleRate)
+        if let pending = pendingBpm {
+            audioBpm = pending
+            pendingBpm = nil
+            prepareBeatBuffers()
+        }
 
-        while nextBeatSampleTime < currentSampleTime + lookaheadSamples {
-            if let pending = pendingBpm {
-                audioBpm = pending
-                pendingBpm = nil
-                prepareBeatBuffers()
-            }
+        let tickToPlay = (audioTimeSignature < 2) ? 0 : currentTick
+        let buffer = (audioTimeSignature >= 2 && tickToPlay == 0) ? beatBufferAccented : beatBufferMain
+        guard let beatBuffer = buffer else { return }
 
-            let tickToPlay = (audioTimeSignature < 2) ? 0 : currentTick
-            let buffer = (audioTimeSignature >= 2 && tickToPlay == 0) ? beatBufferAccented : beatBufferMain
-            guard let beatBuffer = buffer else { return }
-
-            let beatTime = AVAudioTime(sampleTime: nextBeatSampleTime, atRate: playerTime.sampleRate)
-            audioPlayerNode.scheduleBuffer(beatBuffer, at: beatTime, options: [], completionHandler: nil)
-
-            if eventTick != nil {
-                let secondsUntilBeat = max(0, Double(nextBeatSampleTime - currentSampleTime) / playerTime.sampleRate)
-                DispatchQueue.main.asyncAfter(deadline: .now() + secondsUntilBeat) { [weak self] in
-                    self?.eventTick?.send(res: tickToPlay)
-                }
-            }
-
-            let framesPerBeat = AVAudioFramePosition(Double(self.sampleRate) * 60.0 / Double(self.audioBpm))
-            nextBeatSampleTime += framesPerBeat
-            if audioTimeSignature < 2 {
-                currentTick = 0
-            } else {
-                currentTick = (currentTick + 1) % audioTimeSignature
+        if eventTick != nil {
+            DispatchQueue.main.async { [weak self] in
+                self?.eventTick?.send(res: tickToPlay)
             }
         }
-    }
 
-    private func currentPlayerSampleTime() -> AVAudioFramePosition? {
-        guard let nodeTime = audioPlayerNode.lastRenderTime,
-              let playerTime = audioPlayerNode.playerTime(forNodeTime: nodeTime) else { return nil }
-        return playerTime.sampleTime
+        audioPlayerNode.scheduleBuffer(beatBuffer, at: nil, options: [], completionHandler: { [weak self] in
+            self?.schedulingQueue.async {
+                self?.scheduleNextBeat()
+            }
+        })
+
+        if audioTimeSignature < 2 {
+            currentTick = 0
+        } else {
+            currentTick = (currentTick + 1) % audioTimeSignature
+        }
     }
 
     func destroy() {
