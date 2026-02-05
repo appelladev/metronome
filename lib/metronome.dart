@@ -40,7 +40,7 @@ class Metronome {
     int sampleRate = 44100,
   }) async {
     try {
-      MetronomePlatform.instance.init(
+      await MetronomePlatform.instance.init(
         mainPath,
         accentedPath: accentedPath,
         bpm: bpm,

@@ -35,6 +35,9 @@ public class MetronomePlugin implements FlutterPlugin, MethodCallHandler {
       @Override
       public void onListen(Object args, EventChannel.EventSink events) {
         eventTickSink = events;
+        if (metronome != null) {
+          metronome.enableTickCallback(eventTickSink);
+        }
       }
 
       @Override
