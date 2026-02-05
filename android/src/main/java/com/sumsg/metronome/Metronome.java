@@ -165,13 +165,6 @@ public class Metronome {
         new Thread(() -> {
             while (isRunning.get()) {
                 synchronized (mLock) {
-                    if (!isPlaying()) {
-                        try {
-                            Thread.sleep(1);
-                        } catch (InterruptedException ignored) {
-                        }
-                        continue;
-                    }
                     int nextBpm = pendingBpm.getAndSet(0);
                     if (nextBpm > 0 && nextBpm != audioBpm) {
                         audioBpm = nextBpm;

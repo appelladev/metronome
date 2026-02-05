@@ -15,8 +15,8 @@ class Metronome {
     private var sampleRate: Int = 44100
     private var beatBufferMain: AVAudioPCMBuffer?
     private var beatBufferAccented: AVAudioPCMBuffer?
-    private let schedulingQueue = DispatchQueue(label: "metronome.scheduler")
     private var isScheduling: Bool = false
+    private var beatTimer: DispatchSourceTimer?
     private var currentTick: Int = 0
     private var pendingBpm: Int?
     /// Initialize the metronome with the main and accented audio files.
@@ -86,9 +86,7 @@ class Metronome {
         if !audioPlayerNode.isPlaying {
             audioPlayerNode.play()
         }
-        schedulingQueue.async { [weak self] in
-            self?.scheduleNextBeat()
-        }
+        startBeatTimer()
     }
 
     /// Pause the metronome.
@@ -236,39 +234,48 @@ class Metronome {
     private func startScheduler() {
         if isScheduling { return }
         isScheduling = true
-        schedulingQueue.async { [weak self] in
-            self?.scheduleNextBeat()
-        }
+        startBeatTimer()
     }
 
     private func stopScheduler() {
+        beatTimer?.cancel()
+        beatTimer = nil
         isScheduling = false
     }
 
-    private func scheduleNextBeat() {
+    private func startBeatTimer() {
+        beatTimer?.cancel()
+        let beatDuration = 60.0 / Double(audioBpm)
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+        timer.schedule(deadline: .now(), repeating: beatDuration, leeway: .milliseconds(5))
+        timer.setEventHandler { [weak self] in
+            self?.scheduleBeatTick()
+        }
+        beatTimer = timer
+        timer.resume()
+    }
+
+    private func scheduleBeatTick() {
         guard isScheduling else { return }
 
         if let pending = pendingBpm {
             audioBpm = pending
             pendingBpm = nil
             prepareBeatBuffers()
+            startBeatTimer()
         }
 
         let tickToPlay = (audioTimeSignature < 2) ? 0 : currentTick
         let buffer = (audioTimeSignature >= 2 && tickToPlay == 0) ? beatBufferAccented : beatBufferMain
         guard let beatBuffer = buffer else { return }
 
+        audioPlayerNode.scheduleBuffer(beatBuffer, at: nil, options: [], completionHandler: nil)
+
         if eventTick != nil {
             DispatchQueue.main.async { [weak self] in
                 self?.eventTick?.send(res: tickToPlay)
             }
         }
-
-        audioPlayerNode.scheduleBuffer(beatBuffer, at: nil, options: [], completionHandler: { [weak self] in
-            self?.schedulingQueue.async {
-                self?.scheduleNextBeat()
-            }
-        })
 
         if audioTimeSignature < 2 {
             currentTick = 0
