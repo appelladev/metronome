@@ -5,17 +5,17 @@ import static android.media.AudioTrack.PLAYSTATE_PLAYING;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
+import android.media.AudioTimestamp;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 
 import android.media.AudioAttributes;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.ArrayDeque;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
-import android.os.Handler;
-import android.os.Looper;
 import io.flutter.plugin.common.EventChannel;
 
 public class Metronome {
@@ -31,21 +31,14 @@ public class Metronome {
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
     private EventChannel.EventSink eventTickSink;
     private int scheduleTick = 0;
+    private final AudioTimestamp audioTimestamp = new AudioTimestamp();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final Object beatLock = new Object();
-    private final ArrayDeque<BeatEvent> beatQueue = new ArrayDeque<>();
     private long framesWritten = 0;
+    private long lastPlaybackFrames = 0;
+    private final Object tickLock = new Object();
+    private long nextTickFrame = 0;
+    private int nextTickValue = 0;
     private Thread tickThread;
-
-    private static final class BeatEvent {
-        final long frameTime;
-        final int tick;
-
-        BeatEvent(long frameTime, int tick) {
-            this.frameTime = frameTime;
-            this.tick = tick;
-        }
-    }
 
     @SuppressWarnings("deprecation")
     public Metronome(byte[] mainFileBytes, byte[] accentedFileBytes, int bpm, int timeSignature, float volume,
@@ -88,13 +81,15 @@ public class Metronome {
         if (!isRunning.get()) {
             scheduleTick = 0;
             framesWritten = 0;
-            synchronized (beatLock) {
-                beatQueue.clear();
+            lastPlaybackFrames = 0;
+            synchronized (tickLock) {
+                nextTickFrame = 0;
+                nextTickValue = 0;
             }
             isRunning.set(true);
             audioTrack.play();
-            startTickThreadIfNeeded();
             startMetronome();
+            startTickThreadIfNeeded();
         }
     }
 
@@ -104,8 +99,10 @@ public class Metronome {
         audioTrack.flush();
         scheduleTick = 0;
         framesWritten = 0;
-        synchronized (beatLock) {
-            beatQueue.clear();
+        lastPlaybackFrames = 0;
+        synchronized (tickLock) {
+            nextTickFrame = 0;
+            nextTickValue = 0;
         }
     }
 
@@ -115,8 +112,10 @@ public class Metronome {
         audioTrack.stop();
         scheduleTick = 0;
         framesWritten = 0;
-        synchronized (beatLock) {
-            beatQueue.clear();
+        lastPlaybackFrames = 0;
+        synchronized (tickLock) {
+            nextTickFrame = 0;
+            nextTickValue = 0;
         }
     }
 
@@ -192,15 +191,23 @@ public class Metronome {
         return buffer;
     }
 
-    private void emitTickOnMain(int tick) {
+    private void emitTick(int tick) {
         if (eventTickSink == null) {
+            return;
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            try {
+                eventTickSink.success(tick);
+            } catch (Exception ignored) {
+                // Avoid crashing tick thread on event channel errors.
+            }
             return;
         }
         mainHandler.post(() -> {
             try {
                 eventTickSink.success(tick);
             } catch (Exception ignored) {
-                // Avoid crashing audio thread on event channel errors.
+                // Avoid crashing tick thread on event channel errors.
             }
         });
     }
@@ -211,8 +218,31 @@ public class Metronome {
         }
         tickThread = new Thread(() -> {
             while (isRunning.get()) {
-                long playbackFrames = audioTrack.getPlaybackHeadPosition() & 0xffffffffL;
-                drainBeatQueue(playbackFrames);
+                long playbackFrames = getPlaybackFrames();
+                while (true) {
+                    long targetFrame;
+                    int tickValue;
+                    synchronized (tickLock) {
+                        targetFrame = nextTickFrame;
+                        tickValue = nextTickValue;
+                    }
+                    if (playbackFrames < targetFrame) {
+                        break;
+                    }
+                    emitTick(tickValue);
+                    synchronized (tickLock) {
+                        if (audioTimeSignature < 2) {
+                            nextTickValue = 0;
+                        } else {
+                            nextTickValue = (nextTickValue + 1) % audioTimeSignature;
+                        }
+                        int framesPerBeat = (int) (SAMPLE_RATE * 60 / (float) audioBpm);
+                        if (framesPerBeat <= 0) {
+                            framesPerBeat = 1;
+                        }
+                        nextTickFrame += framesPerBeat;
+                    }
+                }
                 try {
                     Thread.sleep(5);
                 } catch (InterruptedException ignored) {
@@ -223,18 +253,26 @@ public class Metronome {
         tickThread.start();
     }
 
-    private void drainBeatQueue(long playbackFrames) {
-        while (true) {
-            BeatEvent event;
-            synchronized (beatLock) {
-                event = beatQueue.peek();
-                if (event == null || event.frameTime > playbackFrames) {
-                    return;
-                }
-                beatQueue.poll();
+    private long getPlaybackFrames() {
+        long head = audioTrack.getPlaybackHeadPosition() & 0xffffffffL;
+        long estimate = head;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            if (audioTrack.getTimestamp(audioTimestamp)) {
+                long now = System.nanoTime();
+                long nanosSince = now - audioTimestamp.nanoTime;
+                long framesSince = (nanosSince * SAMPLE_RATE) / 1_000_000_000L;
+                estimate = audioTimestamp.framePosition + framesSince;
             }
-            emitTickOnMain(event.tick);
         }
+        long current = Math.max(head, estimate);
+        if (current < 0) {
+            current = 0;
+        }
+        if (current < lastPlaybackFrames) {
+            current = lastPlaybackFrames;
+        }
+        lastPlaybackFrames = current;
+        return current;
     }
 
     private void startMetronome() {
@@ -249,7 +287,7 @@ public class Metronome {
                     if (framesPerBeat <= 0) {
                         continue;
                     }
-                    long playbackFrames = audioTrack.getPlaybackHeadPosition() & 0xffffffffL;
+                    long playbackFrames = getPlaybackFrames();
                     long framesInBuffer = framesWritten - playbackFrames;
                     if (framesInBuffer < 0) {
                         framesInBuffer = 0;
@@ -263,19 +301,11 @@ public class Metronome {
                     }
                     int tickToPlay = (audioTimeSignature < 2) ? 0 : scheduleTick;
                     short[] buffer = generateBeatBuffer(tickToPlay);
-                    long beatStartFrame = framesWritten;
-                    boolean enqueued = false;
                     int offset = 0;
                     while (offset < buffer.length && isRunning.get()) {
                         int written = audioTrack.write(buffer, offset, buffer.length - offset);
                         if (written <= 0) {
                             break;
-                        }
-                        if (!enqueued && eventTickSink != null) {
-                            synchronized (beatLock) {
-                                beatQueue.add(new BeatEvent(beatStartFrame, tickToPlay));
-                            }
-                            enqueued = true;
                         }
                         offset += written;
                         framesWritten += written;
