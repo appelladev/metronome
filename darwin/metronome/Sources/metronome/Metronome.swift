@@ -16,9 +16,20 @@ class Metronome {
     private var beatBufferMain: AVAudioPCMBuffer?
     private var beatBufferAccented: AVAudioPCMBuffer?
     private var isScheduling: Bool = false
-    private var beatTimer: DispatchSourceTimer?
+    private var schedulerTimer: DispatchSourceTimer?
+    private var tickPollTimer: DispatchSourceTimer?
+    private let beatQueueLock = DispatchQueue(label: "metronome.beatqueue")
+    private var beatQueue: [BeatEvent] = []
+    private var nextBeatSampleTime: AVAudioFramePosition = 0
+    private var hasSampleTimeAnchor: Bool = false
+    private var sampleTimeOffset: AVAudioFramePosition = 0
     private var currentTick: Int = 0
     private var pendingBpm: Int?
+    
+    private struct BeatEvent {
+        let sampleTime: AVAudioFramePosition
+        let tick: Int
+    }
     /// Initialize the metronome with the main and accented audio files.
     init(mainFileBytes: Data, accentedFileBytes: Data, bpm: Int, timeSignature: Int = 0, volume: Float, sampleRate: Int) {
         self.sampleRate = sampleRate
@@ -83,10 +94,17 @@ class Metronome {
         currentTick = 0
         prepareBeatBuffers()
         isScheduling = true
+        beatQueueLock.sync {
+            beatQueue.removeAll(keepingCapacity: true)
+        }
+        nextBeatSampleTime = 0
+        hasSampleTimeAnchor = false
+        sampleTimeOffset = 0
         if !audioPlayerNode.isPlaying {
             audioPlayerNode.play()
         }
-        startBeatTimer()
+        startTickPoller()
+        startSchedulerPoller()
     }
 
     /// Pause the metronome.
@@ -98,8 +116,15 @@ class Metronome {
     func stop() {
         isScheduling = false
         audioPlayerNode.stop()
-        stopScheduler()
+        stopSchedulerPoller()
+        stopTickPoller()
         currentTick = 0
+        beatQueueLock.sync {
+            beatQueue.removeAll(keepingCapacity: true)
+        }
+        nextBeatSampleTime = 0
+        hasSampleTimeAnchor = false
+        sampleTimeOffset = 0
     }
     
     /// Set the BPM of the metronome.
@@ -231,57 +256,133 @@ class Metronome {
         beatBufferAccented = bufferAccentedClick
     }
 
-    private func startScheduler() {
-        if isScheduling { return }
-        isScheduling = true
-        startBeatTimer()
-    }
-
-    private func stopScheduler() {
-        beatTimer?.cancel()
-        beatTimer = nil
+    private func stopSchedulerPoller() {
+        schedulerTimer?.cancel()
+        schedulerTimer = nil
         isScheduling = false
     }
 
-    private func startBeatTimer() {
-        beatTimer?.cancel()
-        let beatDuration = 60.0 / Double(audioBpm)
+    private func startSchedulerPoller() {
+        schedulerTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
-        timer.schedule(deadline: .now(), repeating: beatDuration, leeway: .milliseconds(5))
+        timer.schedule(deadline: .now(), repeating: .milliseconds(5), leeway: .milliseconds(2))
         timer.setEventHandler { [weak self] in
-            self?.scheduleBeatTick()
+            self?.scheduleBeatsIfNeeded()
         }
-        beatTimer = timer
+        schedulerTimer = timer
         timer.resume()
     }
 
-    private func scheduleBeatTick() {
+    private func scheduleBeatsIfNeeded() {
         guard isScheduling else { return }
+        guard let nodeTime = audioPlayerNode.lastRenderTime,
+              let playerTime = audioPlayerNode.playerTime(forNodeTime: nodeTime) else { return }
 
+        if !hasSampleTimeAnchor {
+            sampleTimeOffset = playerTime.sampleTime
+            hasSampleTimeAnchor = true
+        }
+
+        let virtualCurrentSample = playerTime.sampleTime - sampleTimeOffset
+        if virtualCurrentSample < 0 {
+            return
+        }
+
+        while true {
+            let framesPerBeat = framesPerBeatCount()
+            if nextBeatSampleTime - virtualCurrentSample >= framesPerBeat {
+                break
+            }
+            if !scheduleNextBeat() {
+                break
+            }
+        }
+    }
+
+    private func scheduleNextBeat() -> Bool {
         if let pending = pendingBpm {
             audioBpm = pending
             pendingBpm = nil
             prepareBeatBuffers()
-            startBeatTimer()
         }
 
         let tickToPlay = (audioTimeSignature < 2) ? 0 : currentTick
         let buffer = (audioTimeSignature >= 2 && tickToPlay == 0) ? beatBufferAccented : beatBufferMain
-        guard let beatBuffer = buffer else { return }
+        guard let beatBuffer = buffer else { return false }
 
-        audioPlayerNode.scheduleBuffer(beatBuffer, at: nil, options: [], completionHandler: nil)
+        let scheduleSampleTime = sampleTimeOffset + nextBeatSampleTime
+        let scheduleTime = AVAudioTime(sampleTime: scheduleSampleTime, atRate: Double(sampleRate))
+        audioPlayerNode.scheduleBuffer(beatBuffer, at: scheduleTime, options: [], completionHandler: nil)
 
-        if eventTick != nil {
-            DispatchQueue.main.async { [weak self] in
-                self?.eventTick?.send(res: tickToPlay)
-            }
+        beatQueueLock.sync {
+            beatQueue.append(BeatEvent(sampleTime: nextBeatSampleTime, tick: tickToPlay))
         }
+        nextBeatSampleTime += framesPerBeatCount()
 
         if audioTimeSignature < 2 {
             currentTick = 0
         } else {
             currentTick = (currentTick + 1) % audioTimeSignature
         }
+        return true
+    }
+
+    private func startTickPoller() {
+        tickPollTimer?.cancel()
+        hasSampleTimeAnchor = false
+        sampleTimeOffset = 0
+        beatQueueLock.sync {
+            beatQueue.removeAll(keepingCapacity: true)
+        }
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+        timer.schedule(deadline: .now(), repeating: .milliseconds(5), leeway: .milliseconds(2))
+        timer.setEventHandler { [weak self] in
+            self?.pollTick()
+        }
+        tickPollTimer = timer
+        timer.resume()
+    }
+
+    private func stopTickPoller() {
+        tickPollTimer?.cancel()
+        tickPollTimer = nil
+        hasSampleTimeAnchor = false
+        sampleTimeOffset = 0
+    }
+
+    private func pollTick() {
+        guard isScheduling else { return }
+        guard let nodeTime = audioPlayerNode.lastRenderTime,
+              let playerTime = audioPlayerNode.playerTime(forNodeTime: nodeTime) else { return }
+
+        if !hasSampleTimeAnchor {
+            return
+        }
+
+        let virtualCurrentSample = playerTime.sampleTime - sampleTimeOffset
+        if virtualCurrentSample < 0 {
+            return
+        }
+        var toEmit: [BeatEvent] = []
+        beatQueueLock.sync {
+            while let first = beatQueue.first, first.sampleTime <= virtualCurrentSample {
+                toEmit.append(first)
+                beatQueue.removeFirst()
+            }
+        }
+        if !toEmit.isEmpty, eventTick != nil {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                for event in toEmit {
+                    self.eventTick?.send(res: event.tick)
+                }
+            }
+        }
+    }
+
+    private func framesPerBeatCount() -> AVAudioFramePosition {
+        let frames = Double(sampleRate) * 60.0 / Double(audioBpm)
+        return AVAudioFramePosition(max(1.0, frames))
     }
 
     func destroy() {
@@ -292,7 +393,8 @@ class Metronome {
         audioEngine.detach(audioPlayerNode)
         beatBufferMain = nil
         beatBufferAccented = nil
-        stopScheduler()
+        stopSchedulerPoller()
+        stopTickPoller()
     }
 }
 extension AVAudioFile {

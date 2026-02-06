@@ -106,7 +106,6 @@ class _MyAppState extends State<MyApp> {
                 },
                 onChanged: (val) {
                   bpm = val.toInt();
-                  currentTick = 0;
                   setState(() {});
                 },
               ),
