@@ -1,31 +1,33 @@
-import 'dart:async';
 import 'dart:io';
 import 'dart:js_interop';
-import 'package:flutter_web_plugins/flutter_web_plugins.dart';
+
 import 'package:flutter/services.dart';
+import 'package:flutter_web_plugins/flutter_web_plugins.dart';
 import 'package:web/web.dart' as web;
-import 'src/tick_callback_delay.dart';
+
 import 'metronome_platform_interface.dart';
+import 'src/tick_callback_delay.dart';
 
 class MetronomeWeb extends MetronomePlatform {
   static void registerWith(Registrar registrar) {
     MetronomePlatform.instance = MetronomeWeb();
   }
 
-  final StreamController<int> _tickController = StreamController<int>();
   static const int sampleSize = 16;
   static const int channels = 1;
 
   // Audio context and elements
   web.AudioContext? _audioContext;
+  web.AudioBuffer? _mainSoundOriginal;
   web.AudioBuffer? _mainSoundBuffer;
+  web.AudioBuffer? _accentedSoundOriginal;
   web.AudioBuffer? _accentedSoundBuffer;
-  web.AudioBuffer? _mainSoundBufferTemp;
-  web.AudioBuffer? _accentedSoundBufferTemp;
+  web.AudioBuffer? _mainSoundOriginalTemp;
+  web.AudioBuffer? _accentedSoundOriginalTemp;
   web.AudioBufferSourceNode? _currentSource;
   web.ScriptProcessorNode? _scriptNode;
   web.GainNode? gainNode;
-  //
+
   bool _isPlaying = false;
   int _currentTick = 0;
   int _bpm = 120;
@@ -34,7 +36,7 @@ class MetronomeWeb extends MetronomePlatform {
   double _volume = 1.0;
   bool _enableTickCallback = false;
   int _sampleRate = 44100;
-  //
+
   double _nextBeatTime = 0;
   int _scheduleTimer = 0;
   final Set<int> _tickCallbackTimerIds = <int>{};
@@ -51,24 +53,33 @@ class MetronomeWeb extends MetronomePlatform {
     int timeSignature = 4,
     int sampleRate = 44100,
   }) async {
-    _sampleRate = sampleRate;
-    _audioContext = web.AudioContext(
-      web.AudioContextOptions(
-          latencyHint: 'interactive'.toJS, sampleRate: _sampleRate.toDouble()),
-    );
-    _mainSoundBuffer = await _bytesToAudioBuffer(mainPath);
     if (mainPath == '') {
       throw 'mainPath is empty';
     }
-    if (accentedPath == '') {
-      _accentedSoundBuffer = _mainSoundBuffer;
-    } else {
-      _accentedSoundBuffer = await _bytesToAudioBuffer(accentedPath);
-    }
+
+    _sampleRate = sampleRate;
     _bpm = bpm;
     _timeSignature = timeSignature;
     _volume = volume / 100;
     _enableTickCallback = enableTickCallback;
+
+    _audioContext = web.AudioContext(
+      web.AudioContextOptions(
+        latencyHint: 'interactive'.toJS,
+        sampleRate: _sampleRate.toDouble(),
+      ),
+    );
+
+    _mainSoundOriginal = await _decodeAudioBuffer(mainPath);
+    _mainSoundBuffer = _convertAudioFormat(_mainSoundOriginal!);
+
+    if (accentedPath == '') {
+      _accentedSoundOriginal = _mainSoundOriginal;
+      _accentedSoundBuffer = _mainSoundBuffer;
+    } else {
+      _accentedSoundOriginal = await _decodeAudioBuffer(accentedPath);
+      _accentedSoundBuffer = _convertAudioFormat(_accentedSoundOriginal!);
+    }
   }
 
   @override
@@ -82,7 +93,6 @@ class MetronomeWeb extends MetronomePlatform {
   @override
   Future<void> pause() async {
     stopScheduler();
-    _clearTickCallbackTimers();
     _isPlaying = false;
     _currentSource?.stop();
     _currentSource = null;
@@ -133,6 +143,7 @@ class MetronomeWeb extends MetronomePlatform {
         _pendingBpm = bpm;
       } else {
         _bpm = bpm;
+        _rebuildBeatBuffers();
       }
     }
   }
@@ -154,24 +165,25 @@ class MetronomeWeb extends MetronomePlatform {
     String accentedPath = '',
   }) async {
     if (mainPath != '') {
-      _mainSoundBufferTemp = await _bytesToAudioBuffer(mainPath);
+      _mainSoundOriginalTemp = await _decodeAudioBuffer(mainPath);
     }
     if (accentedPath != '') {
-      _accentedSoundBufferTemp = await _bytesToAudioBuffer(accentedPath);
+      _accentedSoundOriginalTemp = await _decodeAudioBuffer(accentedPath);
     }
   }
 
   @override
   Future<void> destroy() async {
     await stop();
-    _clearTickCallbackTimers();
-    _tickController.close();
+    _mainSoundOriginal = null;
     _mainSoundBuffer = null;
+    _accentedSoundOriginal = null;
     _accentedSoundBuffer = null;
   }
 
   void startScheduler() {
     _nextBeatTime = _audioContext!.currentTime;
+    _clearTickCallbackTimers();
     _schedule();
   }
 
@@ -181,6 +193,7 @@ class MetronomeWeb extends MetronomePlatform {
       if (_pendingBpm != null) {
         _bpm = _pendingBpm!;
         _pendingBpm = null;
+        _rebuildBeatBuffers();
       }
       _scheduleBeat(_nextBeatTime);
       _nextBeatTime += 60.0 / _bpm;
@@ -204,13 +217,15 @@ class MetronomeWeb extends MetronomePlatform {
     source.start(time);
     _scheduleTickCallback(tickToPlay: tickToPlay, scheduledTime: time);
     source.onEnded.listen((_) {
-      if (_mainSoundBufferTemp != null) {
-        _mainSoundBuffer = _mainSoundBufferTemp;
-        _mainSoundBufferTemp = null;
+      if (_mainSoundOriginalTemp != null) {
+        _mainSoundOriginal = _mainSoundOriginalTemp;
+        _mainSoundOriginalTemp = null;
+        _mainSoundBuffer = _convertAudioFormat(_mainSoundOriginal!);
       }
-      if (_accentedSoundBufferTemp != null) {
-        _accentedSoundBuffer = _accentedSoundBufferTemp;
-        _accentedSoundBufferTemp = null;
+      if (_accentedSoundOriginalTemp != null) {
+        _accentedSoundOriginal = _accentedSoundOriginalTemp;
+        _accentedSoundOriginalTemp = null;
+        _accentedSoundBuffer = _convertAudioFormat(_accentedSoundOriginal!);
       }
     });
     _currentTick = (_timeSignature > 1)
@@ -231,6 +246,13 @@ class MetronomeWeb extends MetronomePlatform {
       currentTime: _audioContext!.currentTime,
     );
 
+    if (delayMs <= 0) {
+      if (_isPlaying) {
+        tickController.add(tickToPlay);
+      }
+      return;
+    }
+
     late final int timerId;
     timerId = web.window.setTimeout(
       (() {
@@ -248,6 +270,7 @@ class MetronomeWeb extends MetronomePlatform {
   void stopScheduler() {
     web.window.clearTimeout(_scheduleTimer);
     _nextBeatTime = 0;
+    _clearTickCallbackTimers();
   }
 
   void _clearTickCallbackTimers() {
@@ -257,19 +280,18 @@ class MetronomeWeb extends MetronomePlatform {
     _tickCallbackTimerIds.clear();
   }
 
-  Future<web.AudioBuffer> _bytesToAudioBuffer(String filePath) async {
+  Future<web.AudioBuffer> _decodeAudioBuffer(String filePath) async {
     final byteData = await loadFileBytes(filePath);
     if (byteData.isEmpty) {
       throw Exception('File does not exist: $filePath');
     }
     final jsArrayBuffer = byteData.buffer;
-    // print(await audioBuffer.toDart.then((value) => value.duration));
     final web.AudioBuffer audioBuffer =
         await _audioContext!.decodeAudioData(jsArrayBuffer as dynamic).toDart;
-    return _convertAudioFormat(audioBuffer);
+    return audioBuffer;
   }
 
-  Future<web.AudioBuffer> _convertAudioFormat(web.AudioBuffer original) async {
+  web.AudioBuffer _convertAudioFormat(web.AudioBuffer original) {
     final framesPerBeat = (_sampleRate * 60 / _bpm).round();
     final newBuffer = _audioContext!
         .createBuffer(channels, framesPerBeat, _sampleRate.toDouble());
@@ -301,13 +323,22 @@ class MetronomeWeb extends MetronomePlatform {
     return newBuffer;
   }
 
+  void _rebuildBeatBuffers() {
+    if (_mainSoundOriginal != null) {
+      _mainSoundBuffer = _convertAudioFormat(_mainSoundOriginal!);
+    }
+    if (_accentedSoundOriginal != null) {
+      _accentedSoundBuffer = _convertAudioFormat(_accentedSoundOriginal!);
+    }
+  }
+
   Future<Uint8List> loadFileBytes(String filePath) async {
     if (!filePath.startsWith('/')) {
-      ByteData data = await rootBundle.load(filePath);
+      final ByteData data = await rootBundle.load(filePath);
       return data.buffer.asUint8List();
     } else {
-      File file = File(filePath);
-      bool fileExists = await file.exists();
+      final File file = File(filePath);
+      final bool fileExists = await file.exists();
       if (!fileExists) {
         throw Exception('File does not exist: $filePath');
       }
