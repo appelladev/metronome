@@ -19,6 +19,11 @@ class Metronome {
   ///   },
   /// );
   /// ```
+  ///
+  /// Semantics:
+  /// - Emits at the start of each beat.
+  /// - When `timeSignature > 1`, tick `0` is the accented beat.
+  /// - When `timeSignature < 2`, the tick value is always `0`.
   Stream<int> get tickStream => _platform.tickController.stream;
 
   ///initialize the metronome

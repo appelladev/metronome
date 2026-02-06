@@ -128,4 +128,9 @@ metronome.tickStream.listen((int tick) {
 });
 ```
 
+**Semantics**
+
+- The tick stream emits at the start of each beat.
+- When `timeSignature > 1`, tick `0` is the accented (strong) beat.
+- When `timeSignature < 2`, the tick value is always `0`.
 

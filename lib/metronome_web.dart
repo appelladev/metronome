@@ -1,5 +1,5 @@
-import 'dart:io';
 import 'dart:js_interop';
+import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_web_plugins/flutter_web_plugins.dart';
@@ -24,10 +24,6 @@ class MetronomeWeb extends MetronomePlatform {
   web.AudioBuffer? _accentedSoundBuffer;
   web.AudioBuffer? _mainSoundOriginalTemp;
   web.AudioBuffer? _accentedSoundOriginalTemp;
-  web.AudioBufferSourceNode? _currentSource;
-  web.ScriptProcessorNode? _scriptNode;
-  web.GainNode? gainNode;
-
   bool _isPlaying = false;
   int _currentTick = 0;
   int _bpm = 120;
@@ -94,10 +90,6 @@ class MetronomeWeb extends MetronomePlatform {
   Future<void> pause() async {
     stopScheduler();
     _isPlaying = false;
-    _currentSource?.stop();
-    _currentSource = null;
-    _scriptNode?.disconnect();
-    _scriptNode = null;
   }
 
   @override
@@ -110,9 +102,6 @@ class MetronomeWeb extends MetronomePlatform {
   Future<void> setVolume(int volume) async {
     if (_volume != volume) {
       _volume = volume / 100;
-      if (gainNode != null) {
-        gainNode?.gain.value = _volume;
-      }
     }
   }
 
@@ -336,13 +325,7 @@ class MetronomeWeb extends MetronomePlatform {
     if (!filePath.startsWith('/')) {
       final ByteData data = await rootBundle.load(filePath);
       return data.buffer.asUint8List();
-    } else {
-      final File file = File(filePath);
-      final bool fileExists = await file.exists();
-      if (!fileExists) {
-        throw Exception('File does not exist: $filePath');
-      }
-      return await file.readAsBytes();
     }
+    throw Exception('Absolute file paths are not supported on web: $filePath');
   }
 }
