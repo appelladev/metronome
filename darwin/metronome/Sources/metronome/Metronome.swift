@@ -274,7 +274,7 @@ class Metronome {
     }
 
     private func scheduleBeatsIfNeeded() {
-        guard isScheduling else { return }
+        guard isScheduling, audioEngine.isRunning else { return }
         guard let nodeTime = audioPlayerNode.lastRenderTime,
               let playerTime = audioPlayerNode.playerTime(forNodeTime: nodeTime) else { return }
 
@@ -351,7 +351,7 @@ class Metronome {
     }
 
     private func pollTick() {
-        guard isScheduling else { return }
+        guard isScheduling, audioEngine.isRunning else { return }
         guard let nodeTime = audioPlayerNode.lastRenderTime,
               let playerTime = audioPlayerNode.playerTime(forNodeTime: nodeTime) else { return }
 
@@ -386,15 +386,17 @@ class Metronome {
     }
 
     func destroy() {
-        audioPlayerNode.reset()
+        // Stop scheduling and timers FIRST so background callbacks
+        // don't access the engine while it's being torn down.
+        isScheduling = false
+        stopSchedulerPoller()
+        stopTickPoller()
+
         audioPlayerNode.stop()
-        audioEngine.reset()
         audioEngine.stop()
         audioEngine.detach(audioPlayerNode)
         beatBufferMain = nil
         beatBufferAccented = nil
-        stopSchedulerPoller()
-        stopTickPoller()
     }
 }
 extension AVAudioFile {
