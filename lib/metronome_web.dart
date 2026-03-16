@@ -1,5 +1,4 @@
 import 'dart:js_interop';
-import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_web_plugins/flutter_web_plugins.dart';
@@ -217,9 +216,8 @@ class MetronomeWeb extends MetronomePlatform {
         _accentedSoundBuffer = _convertAudioFormat(_accentedSoundOriginal!);
       }
     });
-    _currentTick = (_timeSignature > 1)
-        ? (_currentTick + 1) % _timeSignature
-        : 0;
+    _currentTick =
+        (_timeSignature > 1) ? (_currentTick + 1) % _timeSignature : 0;
   }
 
   void _scheduleTickCallback({
@@ -234,13 +232,6 @@ class MetronomeWeb extends MetronomePlatform {
       scheduledTime: scheduledTime,
       currentTime: _audioContext!.currentTime,
     );
-
-    if (delayMs <= 0) {
-      if (_isPlaying) {
-        tickController.add(tickToPlay);
-      }
-      return;
-    }
 
     late final int timerId;
     timerId = web.window.setTimeout(
