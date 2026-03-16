@@ -5,7 +5,6 @@ class Metronome {
     private var audioPlayerNode: AVAudioPlayerNode = AVAudioPlayerNode()
     private var audioEngine: AVAudioEngine = AVAudioEngine()
     private var mixerNode: AVAudioMixerNode
-    private var audioBuffer: AVAudioPCMBuffer?
     //
     private var audioFileMain: AVAudioFile
     private var audioFileAccented: AVAudioFile
@@ -14,8 +13,23 @@ class Metronome {
     public var audioTimeSignature: Int = 0
 
     private var sampleRate: Int = 44100
-    private var timer: DispatchSourceTimer?
-    private var startTime: AVAudioTime?
+    private var beatBufferMain: AVAudioPCMBuffer?
+    private var beatBufferAccented: AVAudioPCMBuffer?
+    private var isScheduling: Bool = false
+    private var schedulerTimer: DispatchSourceTimer?
+    private var tickPollTimer: DispatchSourceTimer?
+    private let beatQueueLock = DispatchQueue(label: "metronome.beatqueue")
+    private var beatQueue: [BeatEvent] = []
+    private var nextBeatSampleTime: AVAudioFramePosition = 0
+    private var hasSampleTimeAnchor: Bool = false
+    private var sampleTimeOffset: AVAudioFramePosition = 0
+    private var currentTick: Int = 0
+    private var pendingBpm: Int?
+    
+    private struct BeatEvent {
+        let sampleTime: AVAudioFramePosition
+        let tick: Int
+    }
     /// Initialize the metronome with the main and accented audio files.
     init(mainFileBytes: Data, accentedFileBytes: Data, bpm: Int, timeSignature: Int = 0, volume: Float, sampleRate: Int) {
         self.sampleRate = sampleRate
@@ -76,7 +90,21 @@ class Metronome {
                 return
             }
         }
-        audioBuffer = generateBuffer()
+        if isScheduling { return }
+        currentTick = 0
+        prepareBeatBuffers()
+        isScheduling = true
+        beatQueueLock.sync {
+            beatQueue.removeAll(keepingCapacity: true)
+        }
+        nextBeatSampleTime = 0
+        hasSampleTimeAnchor = false
+        sampleTimeOffset = 0
+        if !audioPlayerNode.isPlaying {
+            audioPlayerNode.play()
+        }
+        startTickPoller()
+        startSchedulerPoller()
     }
 
     /// Pause the metronome.
@@ -86,21 +114,27 @@ class Metronome {
     
     /// Stop the metronome.
     func stop() {
-        if audioBuffer != nil {
-            audioBuffer?.frameLength = 0
-            self.audioPlayerNode.scheduleBuffer(audioBuffer!, at: nil, options: .interruptsAtLoop, completionHandler: nil)
-        }
+        isScheduling = false
         audioPlayerNode.stop()
-        stopBeatTimer()
+        stopSchedulerPoller()
+        stopTickPoller()
+        currentTick = 0
+        beatQueueLock.sync {
+            beatQueue.removeAll(keepingCapacity: true)
+        }
+        nextBeatSampleTime = 0
+        hasSampleTimeAnchor = false
+        sampleTimeOffset = 0
     }
     
     /// Set the BPM of the metronome.
     func setBPM(bpm: Int) {
         if audioBpm != bpm {
-            audioBpm = bpm
             if isPlaying {
-                pause()
-                play()
+                pendingBpm = bpm
+            } else {
+                audioBpm = bpm
+                prepareBeatBuffers()
             }
         }
     }
@@ -205,101 +239,164 @@ class Metronome {
         }
     }
 #endif
-    /// Generate buffer with accents based on time signature
-    private func generateBuffer() -> AVAudioPCMBuffer {
+    private func prepareBeatBuffers() {
         audioFileMain.framePosition = 0
         audioFileAccented.framePosition = 0
 
         let beatLength = AVAudioFrameCount(Double(self.sampleRate) * 60 / Double(self.audioBpm))
-        // let beatLength = AVAudioFrameCount(audioFileMain.processingFormat.sampleRate * 60 / Double(self.audioBpm))
         let bufferMainClick = AVAudioPCMBuffer(pcmFormat: audioFileMain.processingFormat, frameCapacity: beatLength)!
         try! audioFileMain.read(into: bufferMainClick)
         bufferMainClick.frameLength = beatLength
 
-        let bufferBar: AVAudioPCMBuffer
-        if self.audioTimeSignature < 2 {
-            bufferBar = AVAudioPCMBuffer(pcmFormat: audioFileMain.processingFormat, frameCapacity: beatLength)!
-            bufferBar.frameLength = beatLength
+        let bufferAccentedClick = AVAudioPCMBuffer(pcmFormat: audioFileAccented.processingFormat, frameCapacity: beatLength)!
+        try! audioFileAccented.read(into: bufferAccentedClick)
+        bufferAccentedClick.frameLength = beatLength
 
-            let channelCount = Int(audioFileMain.processingFormat.channelCount)
-            let mainClickArray = Array(UnsafeBufferPointer(start: bufferMainClick.floatChannelData![0], count: channelCount * Int(beatLength)))
+        beatBufferMain = bufferMainClick
+        beatBufferAccented = bufferAccentedClick
+    }
 
-            bufferBar.floatChannelData!.pointee.update(from: mainClickArray, count: channelCount * Int(bufferBar.frameLength))
+    private func stopSchedulerPoller() {
+        schedulerTimer?.cancel()
+        schedulerTimer = nil
+        isScheduling = false
+    }
+
+    private func startSchedulerPoller() {
+        schedulerTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+        timer.schedule(deadline: .now(), repeating: .milliseconds(5), leeway: .milliseconds(2))
+        timer.setEventHandler { [weak self] in
+            self?.scheduleBeatsIfNeeded()
+        }
+        schedulerTimer = timer
+        timer.resume()
+    }
+
+    private func scheduleBeatsIfNeeded() {
+        guard isScheduling, audioEngine.isRunning else { return }
+        guard let nodeTime = audioPlayerNode.lastRenderTime,
+              let playerTime = audioPlayerNode.playerTime(forNodeTime: nodeTime) else { return }
+
+        if !hasSampleTimeAnchor {
+            sampleTimeOffset = playerTime.sampleTime
+            hasSampleTimeAnchor = true
+        }
+
+        let virtualCurrentSample = playerTime.sampleTime - sampleTimeOffset
+        if virtualCurrentSample < 0 {
+            return
+        }
+
+        while true {
+            let framesPerBeat = framesPerBeatCount()
+            if nextBeatSampleTime - virtualCurrentSample >= framesPerBeat {
+                break
+            }
+            if !scheduleNextBeat() {
+                break
+            }
+        }
+    }
+
+    private func scheduleNextBeat() -> Bool {
+        if let pending = pendingBpm {
+            audioBpm = pending
+            pendingBpm = nil
+            prepareBeatBuffers()
+        }
+
+        let tickToPlay = (audioTimeSignature < 2) ? 0 : currentTick
+        let buffer = (audioTimeSignature >= 2 && tickToPlay == 0) ? beatBufferAccented : beatBufferMain
+        guard let beatBuffer = buffer else { return false }
+
+        let scheduleSampleTime = sampleTimeOffset + nextBeatSampleTime
+        let scheduleTime = AVAudioTime(sampleTime: scheduleSampleTime, atRate: Double(sampleRate))
+        audioPlayerNode.scheduleBuffer(beatBuffer, at: scheduleTime, options: [], completionHandler: nil)
+
+        beatQueueLock.sync {
+            beatQueue.append(BeatEvent(sampleTime: nextBeatSampleTime, tick: tickToPlay))
+        }
+        nextBeatSampleTime += framesPerBeatCount()
+
+        if audioTimeSignature < 2 {
+            currentTick = 0
         } else {
-            let bufferAccentedClick = AVAudioPCMBuffer(pcmFormat: audioFileAccented.processingFormat, frameCapacity: beatLength)!
-            try! audioFileAccented.read(into: bufferAccentedClick)
-            bufferAccentedClick.frameLength = beatLength
+            currentTick = (currentTick + 1) % audioTimeSignature
+        }
+        return true
+    }
 
-            bufferBar = AVAudioPCMBuffer(pcmFormat: audioFileMain.processingFormat, frameCapacity: beatLength * AVAudioFrameCount(self.audioTimeSignature))!
-            bufferBar.frameLength = beatLength * AVAudioFrameCount(self.audioTimeSignature)
+    private func startTickPoller() {
+        tickPollTimer?.cancel()
+        hasSampleTimeAnchor = false
+        sampleTimeOffset = 0
+        beatQueueLock.sync {
+            beatQueue.removeAll(keepingCapacity: true)
+        }
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+        timer.schedule(deadline: .now(), repeating: .milliseconds(5), leeway: .milliseconds(2))
+        timer.setEventHandler { [weak self] in
+            self?.pollTick()
+        }
+        tickPollTimer = timer
+        timer.resume()
+    }
 
-            let channelCount = Int(audioFileMain.processingFormat.channelCount)
-            let mainClickArray = Array(UnsafeBufferPointer(start: bufferMainClick.floatChannelData![0], count: channelCount * Int(beatLength)))
-            let accentedClickArray = Array(UnsafeBufferPointer(start: bufferAccentedClick.floatChannelData![0], count: channelCount * Int(beatLength)))
+    private func stopTickPoller() {
+        tickPollTimer?.cancel()
+        tickPollTimer = nil
+        hasSampleTimeAnchor = false
+        sampleTimeOffset = 0
+    }
 
-            var barArray = [Float]()
-            for i in 0..<self.audioTimeSignature {
-                if i == 0 {
-                    barArray.append(contentsOf: accentedClickArray)
-                } else {
-                    barArray.append(contentsOf: mainClickArray)
+    private func pollTick() {
+        guard isScheduling, audioEngine.isRunning else { return }
+        guard let nodeTime = audioPlayerNode.lastRenderTime,
+              let playerTime = audioPlayerNode.playerTime(forNodeTime: nodeTime) else { return }
+
+        if !hasSampleTimeAnchor {
+            return
+        }
+
+        let virtualCurrentSample = playerTime.sampleTime - sampleTimeOffset
+        if virtualCurrentSample < 0 {
+            return
+        }
+        var toEmit: [BeatEvent] = []
+        beatQueueLock.sync {
+            while let first = beatQueue.first, first.sampleTime <= virtualCurrentSample {
+                toEmit.append(first)
+                beatQueue.removeFirst()
+            }
+        }
+        if !toEmit.isEmpty, eventTick != nil {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                for event in toEmit {
+                    self.eventTick?.send(res: event.tick)
                 }
             }
-
-            bufferBar.floatChannelData!.pointee.update(from: barArray, count: channelCount * Int(bufferBar.frameLength))
-        }
-        //
-        self.startTime = self.audioPlayerNode.lastRenderTime
-        self.audioPlayerNode.scheduleBuffer(bufferBar, at: nil, options: .loops,completionHandler: nil)
-        self.audioPlayerNode.play()
-        startBeatTimer()
-        return bufferBar
-    }
-    
-    func stopBeatTimer() {
-        if timer != nil {
-            timer?.cancel()
-            timer = nil
         }
     }
-    
-    private func startBeatTimer() {
-        if self.eventTick == nil {return}
-        let beatDuration = 60.0 / Double(audioBpm)
-        timer?.cancel()
-        timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .background))
-        timer?.schedule(deadline: .now(), repeating: beatDuration, leeway: .milliseconds(10))
-        timer?.setEventHandler { [weak self] in
-            guard let self = self else { return }
-            guard let startTime = self.startTime,
-                  let currentTime = self.audioPlayerNode.lastRenderTime,
-                  let elapsedTime = self.getElapsedTime(from: startTime, to: currentTime) else { return }
 
-            let currentBeat = Int(elapsedTime / beatDuration)
-            let currentTick = (self.audioTimeSignature > 1) ? (currentBeat % self.audioTimeSignature) : 0
-
-            DispatchQueue.main.async {
-                self.eventTick?.send(res: currentTick)
-            }
-        }
-
-        timer?.resume()
-    }
-    
-    private func getElapsedTime(from startTime: AVAudioTime, to currentTime: AVAudioTime) -> TimeInterval? {
-//        guard let sampleRate = startTime.sampleRate as Double? else { return nil }
-        let elapsedSamples = currentTime.sampleTime - startTime.sampleTime
-        return Double(elapsedSamples) / Double(self.sampleRate)
+    private func framesPerBeatCount() -> AVAudioFramePosition {
+        let frames = Double(sampleRate) * 60.0 / Double(audioBpm)
+        return AVAudioFramePosition(max(1.0, frames))
     }
 
     func destroy() {
-        audioPlayerNode.reset()
+        // Stop scheduling and timers FIRST so background callbacks
+        // don't access the engine while it's being torn down.
+        isScheduling = false
+        stopSchedulerPoller()
+        stopTickPoller()
+
         audioPlayerNode.stop()
-        audioEngine.reset()
         audioEngine.stop()
         audioEngine.detach(audioPlayerNode)
-        audioBuffer = nil
-        stopBeatTimer()
+        beatBufferMain = nil
+        beatBufferAccented = nil
     }
 }
 extension AVAudioFile {
