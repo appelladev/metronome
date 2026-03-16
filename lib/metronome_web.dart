@@ -4,6 +4,7 @@ import 'dart:js_interop';
 import 'package:flutter_web_plugins/flutter_web_plugins.dart';
 import 'package:flutter/services.dart';
 import 'package:web/web.dart' as web;
+import 'src/tick_callback_delay.dart';
 import 'metronome_platform_interface.dart';
 
 class MetronomeWeb extends MetronomePlatform {
@@ -35,6 +36,7 @@ class MetronomeWeb extends MetronomePlatform {
   //
   double _nextBeatTime = 0;
   int _scheduleTimer = 0;
+  final Set<int> _tickCallbackTimerIds = <int>{};
   final double _lookahead = 0.1;
   final double _scheduleInterval = 0.05;
 
@@ -79,6 +81,7 @@ class MetronomeWeb extends MetronomePlatform {
   @override
   Future<void> pause() async {
     stopScheduler();
+    _clearTickCallbackTimers();
     _isPlaying = false;
     _currentSource?.stop();
     _currentSource = null;
@@ -133,6 +136,10 @@ class MetronomeWeb extends MetronomePlatform {
   Future<void> setTimeSignature(int timeSignature) async {
     if (timeSignature != _timeSignature) {
       _timeSignature = timeSignature;
+      if (_isPlaying) {
+        await pause();
+        await play();
+      }
     }
   }
 
@@ -152,6 +159,7 @@ class MetronomeWeb extends MetronomePlatform {
   @override
   Future<void> destroy() async {
     await stop();
+    _clearTickCallbackTimers();
     _tickController.close();
     _mainSoundBuffer = null;
     _accentedSoundBuffer = null;
@@ -175,7 +183,8 @@ class MetronomeWeb extends MetronomePlatform {
   }
 
   void _scheduleBeat(double time) {
-    final isAccented = (_currentTick % _timeSignature) == 0;
+    final tickToPlay = _currentTick;
+    final isAccented = (tickToPlay % _timeSignature) == 0;
     final buffer = isAccented ? _accentedSoundBuffer : _mainSoundBuffer;
     final source = _audioContext!.createBufferSource();
     source.buffer = buffer;
@@ -184,6 +193,8 @@ class MetronomeWeb extends MetronomePlatform {
     source.connect(gainNode);
     gainNode.connect(_audioContext!.destination);
     source.start(time);
+    _scheduleTickCallback(tickToPlay: tickToPlay, scheduledTime: time);
+    _currentTick = (tickToPlay + 1) % _timeSignature;
     source.onEnded.listen((_) {
       if (_mainSoundBufferTemp != null) {
         _mainSoundBuffer = _mainSoundBufferTemp;
@@ -193,16 +204,46 @@ class MetronomeWeb extends MetronomePlatform {
         _accentedSoundBuffer = _accentedSoundBufferTemp;
         _accentedSoundBufferTemp = null;
       }
-      if (_enableTickCallback) {
-        tickController.add(_currentTick);
-      }
-      _currentTick = (_currentTick + 1) % _timeSignature;
     });
+  }
+
+  void _scheduleTickCallback({
+    required int tickToPlay,
+    required double scheduledTime,
+  }) {
+    if (!_enableTickCallback) {
+      return;
+    }
+
+    final delayMs = calculateTickCallbackDelayMs(
+      scheduledTime: scheduledTime,
+      currentTime: _audioContext!.currentTime,
+    );
+
+    late final int timerId;
+    timerId = web.window.setTimeout(
+      (() {
+        _tickCallbackTimerIds.remove(timerId);
+        if (!_isPlaying || !_enableTickCallback) {
+          return;
+        }
+        tickController.add(tickToPlay);
+      }).toJS,
+      delayMs as JSAny?,
+    );
+    _tickCallbackTimerIds.add(timerId);
   }
 
   void stopScheduler() {
     web.window.clearTimeout(_scheduleTimer);
     _nextBeatTime = 0;
+  }
+
+  void _clearTickCallbackTimers() {
+    for (final timerId in _tickCallbackTimerIds) {
+      web.window.clearTimeout(timerId);
+    }
+    _tickCallbackTimerIds.clear();
   }
 
   Future<web.AudioBuffer> _bytesToAudioBuffer(String filePath) async {
