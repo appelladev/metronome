@@ -289,8 +289,7 @@ class Metronome {
         }
 
         while true {
-            let framesPerBeat = framesPerBeatCount()
-            if nextBeatSampleTime - virtualCurrentSample >= framesPerBeat {
+            if nextBeatSampleTime - virtualCurrentSample >= schedulerLeadTimeFramesCount() {
                 break
             }
             if !scheduleNextBeat() {
@@ -383,6 +382,23 @@ class Metronome {
     private func framesPerBeatCount() -> AVAudioFramePosition {
         let frames = Double(sampleRate) * 60.0 / Double(audioBpm)
         return AVAudioFramePosition(max(1.0, frames))
+    }
+
+    private func schedulerLeadTimeFramesCount() -> AVAudioFramePosition {
+        let leadTimeFrames = Double(sampleRate) * schedulerLeadTimeSeconds()
+        return AVAudioFramePosition(max(1.0, leadTimeFrames))
+    }
+
+    private func schedulerLeadTimeSeconds() -> Double {
+#if os(iOS)
+        let audioSession = AVAudioSession.sharedInstance()
+        let outputLatency = max(0.0, audioSession.outputLatency)
+        let ioBufferDuration = max(0.0, audioSession.ioBufferDuration)
+        let latencyBasedLead = outputLatency + (ioBufferDuration * 2.0)
+        return min(0.12, max(0.06, latencyBasedLead))
+#else
+        return 0.06
+#endif
     }
 
     func destroy() {

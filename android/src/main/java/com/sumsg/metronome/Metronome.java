@@ -12,6 +12,10 @@ import android.os.Looper;
 
 import android.media.AudioAttributes;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -33,12 +37,22 @@ public class Metronome {
     private int scheduleTick = 0;
     private final AudioTimestamp audioTimestamp = new AudioTimestamp();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Object beatQueueLock = new Object();
+    private final Deque<BeatEvent> beatQueue = new ArrayDeque<>();
     private long framesWritten = 0;
     private long lastPlaybackFrames = 0;
-    private final Object tickLock = new Object();
-    private long nextTickFrame = 0;
-    private int nextTickValue = 0;
+    private volatile boolean hasPlaybackProgress = false;
     private Thread tickThread;
+
+    private static final class BeatEvent {
+        private final long framePosition;
+        private final int tick;
+
+        private BeatEvent(long framePosition, int tick) {
+            this.framePosition = framePosition;
+            this.tick = tick;
+        }
+    }
 
     @SuppressWarnings("deprecation")
     public Metronome(byte[] mainFileBytes, byte[] accentedFileBytes, int bpm, int timeSignature, float volume,
@@ -82,10 +96,8 @@ public class Metronome {
             scheduleTick = 0;
             framesWritten = 0;
             lastPlaybackFrames = 0;
-            synchronized (tickLock) {
-                nextTickFrame = 0;
-                nextTickValue = 0;
-            }
+            hasPlaybackProgress = false;
+            clearBeatQueue();
             isRunning.set(true);
             audioTrack.play();
             startMetronome();
@@ -100,10 +112,9 @@ public class Metronome {
         scheduleTick = 0;
         framesWritten = 0;
         lastPlaybackFrames = 0;
-        synchronized (tickLock) {
-            nextTickFrame = 0;
-            nextTickValue = 0;
-        }
+        hasPlaybackProgress = false;
+        stopTickThread();
+        clearBeatQueue();
     }
 
     public void stop() {
@@ -113,10 +124,9 @@ public class Metronome {
         scheduleTick = 0;
         framesWritten = 0;
         lastPlaybackFrames = 0;
-        synchronized (tickLock) {
-            nextTickFrame = 0;
-            nextTickValue = 0;
-        }
+        hasPlaybackProgress = false;
+        stopTickThread();
+        clearBeatQueue();
     }
 
     public void setBPM(int bpm) {
@@ -212,40 +222,69 @@ public class Metronome {
         });
     }
 
+    private void clearBeatQueue() {
+        synchronized (beatQueueLock) {
+            beatQueue.clear();
+        }
+    }
+
+    private void enqueueBeat(long beatStartFrame, int tick) {
+        synchronized (beatQueueLock) {
+            beatQueue.addLast(new BeatEvent(beatStartFrame, tick));
+        }
+    }
+
+    private void discardQueuedBeat(long beatStartFrame, int tick) {
+        synchronized (beatQueueLock) {
+            BeatEvent last = beatQueue.peekLast();
+            if (last != null && last.framePosition == beatStartFrame && last.tick == tick) {
+                beatQueue.removeLast();
+            }
+        }
+    }
+
+    private void stopTickThread() {
+        if (tickThread != null) {
+            tickThread.interrupt();
+            tickThread = null;
+        }
+    }
+
     private void startTickThreadIfNeeded() {
-        if (eventTickSink == null || !isRunning.get() || tickThread != null) {
+        if (!isRunning.get() || tickThread != null) {
             return;
         }
         tickThread = new Thread(() -> {
             while (isRunning.get()) {
                 long playbackFrames = getPlaybackFrames();
-                while (true) {
-                    long targetFrame;
-                    int tickValue;
-                    synchronized (tickLock) {
-                        targetFrame = nextTickFrame;
-                        tickValue = nextTickValue;
-                    }
-                    if (playbackFrames < targetFrame) {
-                        break;
-                    }
-                    emitTick(tickValue);
-                    synchronized (tickLock) {
-                        if (audioTimeSignature < 2) {
-                            nextTickValue = 0;
-                        } else {
-                            nextTickValue = (nextTickValue + 1) % audioTimeSignature;
+                if (!hasPlaybackProgress) {
+                    // Match Darwin semantics by waiting for real AudioTrack progress
+                    // before emitting the first queued beat at frame 0.
+                    if (playbackFrames <= 0) {
+                        try {
+                            Thread.sleep(1);
+                        } catch (InterruptedException ignored) {
+                            Thread.currentThread().interrupt();
+                            break;
                         }
-                        int framesPerBeat = (int) (SAMPLE_RATE * 60 / (float) audioBpm);
-                        if (framesPerBeat <= 0) {
-                            framesPerBeat = 1;
-                        }
-                        nextTickFrame += framesPerBeat;
+                        continue;
                     }
+                    hasPlaybackProgress = true;
+                }
+                List<BeatEvent> dueEvents = new ArrayList<>();
+                synchronized (beatQueueLock) {
+                    while (!beatQueue.isEmpty() && beatQueue.peekFirst().framePosition <= playbackFrames) {
+                        dueEvents.add(beatQueue.removeFirst());
+                    }
+                }
+                for (BeatEvent event : dueEvents) {
+                    emitTick(event.tick);
                 }
                 try {
                     Thread.sleep(5);
                 } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
             }
             tickThread = null;
@@ -301,6 +340,10 @@ public class Metronome {
                     }
                     int tickToPlay = (audioTimeSignature < 2) ? 0 : scheduleTick;
                     short[] buffer = generateBeatBuffer(tickToPlay);
+                    long beatStartFrame = framesWritten;
+                    // Queue the beat boundary before a blocking write so the next
+                    // tick is not delayed until the write call returns.
+                    enqueueBeat(beatStartFrame, tickToPlay);
                     int offset = 0;
                     while (offset < buffer.length && isRunning.get()) {
                         int written = audioTrack.write(buffer, offset, buffer.length - offset);
@@ -309,6 +352,10 @@ public class Metronome {
                         }
                         offset += written;
                         framesWritten += written;
+                    }
+                    if (offset != buffer.length) {
+                        discardQueuedBeat(beatStartFrame, tickToPlay);
+                        continue;
                     }
                     if (audioTimeSignature < 2) {
                         scheduleTick = 0;
