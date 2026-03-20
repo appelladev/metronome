@@ -52,42 +52,57 @@ public class MetronomePlugin implements FlutterPlugin, MethodCallHandler {
     switch (call.method) {
       case "init":
         metronomeInit(call);
+        result.success(null);
         break;
       case "play":
-        metronome.play();
+        if (metronome != null) {
+          metronome.play();
+        }
+        result.success(null);
         break;
       case "pause":
-        metronome.pause();
+        if (metronome != null) {
+          metronome.pause();
+        }
+        result.success(null);
         break;
       case "stop":
-        metronome.stop();
+        if (metronome != null) {
+          metronome.stop();
+        }
+        result.success(null);
         break;
       case "getVolume":
-        result.success(metronome.audioVolume);
+        result.success(metronome != null ? Math.round(metronome.audioVolume * 100.0f) : 0);
         break;
       case "setVolume":
         setVolume(call);
+        result.success(null);
         break;
       case "isPlaying":
-        result.success(metronome.isPlaying());
+        result.success(metronome != null && metronome.isPlaying());
         break;
       case "setBPM":
         setBPM(call);
+        result.success(null);
         break;
       case "getBPM":
-        result.success(metronome.audioBpm);
+        result.success(metronome != null ? metronome.audioBpm : 0);
         break;
       case "setTimeSignature":
         setTimeSignature(call);
+        result.success(null);
         break;
       case "getTimeSignature":
-        result.success(metronome.audioTimeSignature);
+        result.success(metronome != null ? metronome.audioTimeSignature : 0);
         break;
       case "setAudioFile":
         setAudioFile(call);
+        result.success(null);
         break;
       case "destroy":
-        metronome.destroy();
+        destroyMetronome();
+        result.success(null);
         break;
       default:
         result.notImplemented();
@@ -102,6 +117,8 @@ public class MetronomePlugin implements FlutterPlugin, MethodCallHandler {
   }
 
   private void metronomeInit(@NonNull MethodCall call) {
+    destroyMetronome();
+
     byte[] mainFileBytes = call.argument("mainFileBytes");
     if (mainFileBytes == null) {
       mainFileBytes = new byte[0];
@@ -172,5 +189,14 @@ public class MetronomePlugin implements FlutterPlugin, MethodCallHandler {
       }
       metronome.setAudioFile(mainFileBytes, accentedFileBytes);
     }
+  }
+
+  private void destroyMetronome() {
+    if (metronome == null) {
+      return;
+    }
+
+    metronome.destroy();
+    metronome = null;
   }
 }

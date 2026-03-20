@@ -33,45 +33,54 @@ public class MetronomePlugin: NSObject, FlutterPlugin {
           switch call.method {
               case "init":
                   metronomeInit(attributes: attributes)
+                  result(nil)
                 break;
               case "play":
                   metronome?.play()
+                  result(nil)
                 break;
               case "pause":
                   metronome?.pause()
+                  result(nil)
                 break;
               case "stop":
                   metronome?.stop()
+                  result(nil)
                 break;
               case "getVolume":
-                  result(metronome?.getVolume)
+                  result(metronome?.getVolume ?? 0)
                 break;
               case "setVolume":
                   setVolume(attributes: attributes)
+                  result(nil)
                 break;
               case "isPlaying":
-                  result(metronome?.isPlaying)
+                  result(metronome?.isPlaying ?? false)
                 break;
               case "setBPM":
                   setBPM(attributes: attributes)
+                  result(nil)
                 break;
               case "getBPM":
-                  result(metronome?.audioBpm)
+                  result(metronome?.audioBpm ?? 0)
                 break;
               case "setTimeSignature":
                   setTimeSignature(attributes: attributes)
+                  result(nil)
                 break;
               case "getTimeSignature":
-                  result(metronome?.audioTimeSignature)
+                  result(metronome?.audioTimeSignature ?? 0)
                 break;
               case "setAudioFile":
                   setAudioFile(attributes: attributes)
+                  result(nil)
                 break;
               case "destroy":
-                  metronome?.destroy()
+                  destroyMetronome()
+                  result(nil)
                 break;
               default:
-                  result("unkown")
+                  result(FlutterMethodNotImplemented)
                 break;
         }
     }
@@ -92,11 +101,13 @@ public class MetronomePlugin: NSObject, FlutterPlugin {
         }
     }
     private func metronomeInit( attributes:NSDictionary?) {
+        destroyMetronome()
+
         let mainFileBytes = (attributes?["mainFileBytes"] as? FlutterStandardTypedData) ?? FlutterStandardTypedData()
         let accentedFileBytes = (attributes?["accentedFileBytes"] as? FlutterStandardTypedData) ?? FlutterStandardTypedData()
         let mainBytes: Data = mainFileBytes.data
         let accentedBytes: Data = accentedFileBytes.data
-        
+
         let enableTickCallback: Bool = (attributes?["enableTickCallback"] as? Bool) ?? true
         let timeSignature: Int = (attributes?["timeSignature"] as? Int) ?? 0
         let bpm: Int = (attributes?["bpm"] as? Int) ?? 120
@@ -121,5 +132,9 @@ public class MetronomePlugin: NSObject, FlutterPlugin {
             let volume: Double = (attributes?["volume"] as? Double) ?? 0.5
             metronome?.setVolume(volume: Float(volume))
         }
+    }
+    private func destroyMetronome() {
+        metronome?.destroy()
+        metronome = nil
     }
 }

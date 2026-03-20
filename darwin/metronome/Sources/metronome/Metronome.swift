@@ -25,6 +25,10 @@ class Metronome {
     private var sampleTimeOffset: AVAudioFramePosition = 0
     private var currentTick: Int = 0
     private var pendingBpm: Int?
+#if os(iOS)
+    private var interruptionObserver: NSObjectProtocol?
+    private var routeChangeObserver: NSObjectProtocol?
+#endif
     
     private struct BeatEvent {
         let sampleTime: AVAudioFramePosition
@@ -187,18 +191,43 @@ class Metronome {
     }
 #if os(iOS)
     private func setupNotifications() {
-        NotificationCenter.default.addObserver(
+        removeNotifications()
+
+        interruptionObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification,
             object: nil,
             queue: .main,
             using: handleInterruption
         )
-        NotificationCenter.default.addObserver(
+        routeChangeObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification,
             object: nil,
             queue: .main,
             using: handleRouteChange
         )
+    }
+
+    private func removeNotifications() {
+        let notificationCenter = NotificationCenter.default
+        if let interruptionObserver {
+            notificationCenter.removeObserver(interruptionObserver)
+            self.interruptionObserver = nil
+        }
+        if let routeChangeObserver {
+            notificationCenter.removeObserver(routeChangeObserver)
+            self.routeChangeObserver = nil
+        }
+    }
+
+    private func deactivateAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(
+                false,
+                options: [.notifyOthersOnDeactivation]
+            )
+        } catch {
+            print("Failed to deactivate audio session: \(error)")
+        }
     }
 
     private func handleInterruption(_ notification: Notification) {
@@ -407,12 +436,29 @@ class Metronome {
         isScheduling = false
         stopSchedulerPoller()
         stopTickPoller()
+#if os(iOS)
+        removeNotifications()
+#endif
 
         audioPlayerNode.stop()
+        audioPlayerNode.reset()
         audioEngine.stop()
+        audioEngine.reset()
         audioEngine.detach(audioPlayerNode)
+        eventTick = nil
+        pendingBpm = nil
+        currentTick = 0
+        nextBeatSampleTime = 0
+        hasSampleTimeAnchor = false
+        sampleTimeOffset = 0
+        beatQueueLock.sync {
+            beatQueue.removeAll(keepingCapacity: false)
+        }
         beatBufferMain = nil
         beatBufferAccented = nil
+#if os(iOS)
+        deactivateAudioSession()
+#endif
     }
 }
 extension AVAudioFile {
