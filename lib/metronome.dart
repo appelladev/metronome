@@ -1,6 +1,9 @@
 import 'dart:async';
 
 import 'metronome_platform_interface.dart';
+import 'src/metronome_tick_event.dart';
+
+export 'src/metronome_tick_event.dart';
 
 class Metronome {
   static final Metronome _instance = Metronome._internal();
@@ -25,6 +28,10 @@ class Metronome {
   /// - When `timeSignature > 1`, tick `0` is the accented beat.
   /// - When `timeSignature < 2`, the tick value is always `0`.
   Stream<int> get tickStream => _platform.tickController.stream;
+
+  /// Emits beat timing metadata for each tick.
+  Stream<MetronomeTickEvent> get tickEventStream =>
+      _platform.tickEventController.stream;
 
   ///initialize the metronome
   /// ```

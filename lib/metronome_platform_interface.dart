@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'metronome_method_channel.dart';
+import 'src/metronome_tick_event.dart';
 
 abstract class MetronomePlatform extends PlatformInterface {
   /// Constructs a MetronomePlatform.
@@ -27,6 +28,8 @@ abstract class MetronomePlatform extends PlatformInterface {
 
   final StreamController<int> tickController =
       StreamController<int>.broadcast();
+  final StreamController<MetronomeTickEvent> tickEventController =
+      StreamController<MetronomeTickEvent>.broadcast();
 
   Future<void> init(
     String mainPath, {

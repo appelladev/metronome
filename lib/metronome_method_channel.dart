@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'metronome_platform_interface.dart';
+import 'src/metronome_tick_event.dart';
 
 /// An implementation of [MetronomePlatform] that uses method channels.
 class MethodChannelMetronome extends MetronomePlatform {
@@ -16,8 +17,14 @@ class MethodChannelMetronome extends MetronomePlatform {
   MethodChannelMetronome() {
     eventTickChannel.receiveBroadcastStream().listen(
       (event) {
-        if (event is int) {
-          tickController.add(event);
+        try {
+          final tickEvent = MetronomeTickEvent.fromPlatformEvent(event);
+          tickEventController.add(tickEvent);
+          tickController.add(tickEvent.tick);
+        } catch (error) {
+          if (kDebugMode) {
+            print(error);
+          }
         }
       },
       onError: (error) {

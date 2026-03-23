@@ -6,7 +6,7 @@ import FlutterMacOS
 class EventTickHandler: NSObject,FlutterStreamHandler {
     private var eventSink: FlutterEventSink?
     
-    public func send(res:Int){
+    public func send(res: Any){
         if let event = eventSink {
             event(res)
         }

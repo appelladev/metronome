@@ -5,6 +5,7 @@ import 'package:flutter_web_plugins/flutter_web_plugins.dart';
 import 'package:web/web.dart' as web;
 
 import 'metronome_platform_interface.dart';
+import 'src/metronome_tick_event.dart';
 import 'src/tick_callback_delay.dart';
 
 class MetronomeWeb extends MetronomePlatform {
@@ -194,6 +195,7 @@ class MetronomeWeb extends MetronomePlatform {
 
   void _scheduleBeat(double time) {
     final tickToPlay = _timeSignature > 1 ? _currentTick : 0;
+    final beatDurationSeconds = 60.0 / _bpm;
     final isAccented = (_timeSignature > 1) && (tickToPlay == 0);
     final buffer = isAccented ? _accentedSoundBuffer : _mainSoundBuffer;
     final source = _audioContext!.createBufferSource();
@@ -203,7 +205,11 @@ class MetronomeWeb extends MetronomePlatform {
     source.connect(gainNode);
     gainNode.connect(_audioContext!.destination);
     source.start(time);
-    _scheduleTickCallback(tickToPlay: tickToPlay, scheduledTime: time);
+    _scheduleTickCallback(
+      tickToPlay: tickToPlay,
+      scheduledTime: time,
+      beatDurationSeconds: beatDurationSeconds,
+    );
     source.onEnded.listen((_) {
       if (_mainSoundOriginalTemp != null) {
         _mainSoundOriginal = _mainSoundOriginalTemp;
@@ -223,6 +229,7 @@ class MetronomeWeb extends MetronomePlatform {
   void _scheduleTickCallback({
     required int tickToPlay,
     required double scheduledTime,
+    required double beatDurationSeconds,
   }) {
     if (!_enableTickCallback) {
       return;
@@ -240,7 +247,19 @@ class MetronomeWeb extends MetronomePlatform {
         if (!_isPlaying || !_enableTickCallback) {
           return;
         }
-        tickController.add(tickToPlay);
+        final elapsedMicros =
+            ((_audioContext!.currentTime - scheduledTime) * 1e6)
+                .round()
+                .clamp(0, (beatDurationSeconds * 1e6).round());
+        final tickEvent = MetronomeTickEvent(
+          tick: tickToPlay,
+          beatDuration: Duration(
+            microseconds: (beatDurationSeconds * 1e6).round(),
+          ),
+          elapsedSinceBeatStart: Duration(microseconds: elapsedMicros),
+        );
+        tickEventController.add(tickEvent);
+        tickController.add(tickEvent.tick);
       }).toJS,
       delayMs as JSAny?,
     );

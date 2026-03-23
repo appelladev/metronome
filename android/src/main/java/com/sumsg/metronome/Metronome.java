@@ -15,7 +15,9 @@ import android.media.AudioAttributes;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -46,10 +48,12 @@ public class Metronome {
 
     private static final class BeatEvent {
         private final long framePosition;
+        private final long beatDurationFrames;
         private final int tick;
 
-        private BeatEvent(long framePosition, int tick) {
+        private BeatEvent(long framePosition, long beatDurationFrames, int tick) {
             this.framePosition = framePosition;
+            this.beatDurationFrames = beatDurationFrames;
             this.tick = tick;
         }
     }
@@ -201,13 +205,27 @@ public class Metronome {
         return buffer;
     }
 
-    private void emitTick(int tick) {
+    private long framesToMicros(long frames) {
+        return (frames * 1_000_000L) / SAMPLE_RATE;
+    }
+
+    private void emitTick(BeatEvent beatEvent, long playbackFrames) {
         if (eventTickSink == null) {
             return;
         }
+        long elapsedFrames = Math.max(0L, playbackFrames - beatEvent.framePosition);
+        long beatDurationMicros = Math.max(0L, framesToMicros(beatEvent.beatDurationFrames));
+        long elapsedMicros = Math.min(
+                beatDurationMicros,
+                Math.max(0L, framesToMicros(elapsedFrames))
+        );
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("tick", beatEvent.tick);
+        payload.put("beatDurationMicros", beatDurationMicros);
+        payload.put("elapsedSinceBeatStartMicros", elapsedMicros);
         if (Looper.myLooper() == Looper.getMainLooper()) {
             try {
-                eventTickSink.success(tick);
+                eventTickSink.success(payload);
             } catch (Exception ignored) {
                 // Avoid crashing tick thread on event channel errors.
             }
@@ -215,7 +233,7 @@ public class Metronome {
         }
         mainHandler.post(() -> {
             try {
-                eventTickSink.success(tick);
+                eventTickSink.success(payload);
             } catch (Exception ignored) {
                 // Avoid crashing tick thread on event channel errors.
             }
@@ -228,9 +246,9 @@ public class Metronome {
         }
     }
 
-    private void enqueueBeat(long beatStartFrame, int tick) {
+    private void enqueueBeat(long beatStartFrame, long beatDurationFrames, int tick) {
         synchronized (beatQueueLock) {
-            beatQueue.addLast(new BeatEvent(beatStartFrame, tick));
+            beatQueue.addLast(new BeatEvent(beatStartFrame, beatDurationFrames, tick));
         }
     }
 
@@ -278,7 +296,7 @@ public class Metronome {
                     }
                 }
                 for (BeatEvent event : dueEvents) {
-                    emitTick(event.tick);
+                    emitTick(event, playbackFrames);
                 }
                 try {
                     Thread.sleep(5);
@@ -343,7 +361,7 @@ public class Metronome {
                     long beatStartFrame = framesWritten;
                     // Queue the beat boundary before a blocking write so the next
                     // tick is not delayed until the write call returns.
-                    enqueueBeat(beatStartFrame, tickToPlay);
+                    enqueueBeat(beatStartFrame, framesPerBeat, tickToPlay);
                     int offset = 0;
                     while (offset < buffer.length && isRunning.get()) {
                         int written = audioTrack.write(buffer, offset, buffer.length - offset);

@@ -32,6 +32,7 @@ class Metronome {
     
     private struct BeatEvent {
         let sampleTime: AVAudioFramePosition
+        let beatDurationFrames: AVAudioFramePosition
         let tick: Int
     }
     /// Initialize the metronome with the main and accented audio files.
@@ -334,6 +335,7 @@ class Metronome {
             prepareBeatBuffers()
         }
 
+        let beatDurationFrames = framesPerBeatCount()
         let tickToPlay = (audioTimeSignature < 2) ? 0 : currentTick
         let buffer = (audioTimeSignature >= 2 && tickToPlay == 0) ? beatBufferAccented : beatBufferMain
         guard let beatBuffer = buffer else { return false }
@@ -343,9 +345,15 @@ class Metronome {
         audioPlayerNode.scheduleBuffer(beatBuffer, at: scheduleTime, options: [], completionHandler: nil)
 
         beatQueueLock.sync {
-            beatQueue.append(BeatEvent(sampleTime: nextBeatSampleTime, tick: tickToPlay))
+            beatQueue.append(
+                BeatEvent(
+                    sampleTime: nextBeatSampleTime,
+                    beatDurationFrames: beatDurationFrames,
+                    tick: tickToPlay
+                )
+            )
         }
-        nextBeatSampleTime += framesPerBeatCount()
+        nextBeatSampleTime += beatDurationFrames
 
         if audioTimeSignature < 2 {
             currentTick = 0
@@ -402,10 +410,36 @@ class Metronome {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 for event in toEmit {
-                    self.eventTick?.send(res: event.tick)
+                    self.eventTick?.send(
+                        res: self.tickPayload(
+                            for: event,
+                            virtualCurrentSample: virtualCurrentSample
+                        )
+                    )
                 }
             }
         }
+    }
+
+    private func tickPayload(
+        for event: BeatEvent,
+        virtualCurrentSample: AVAudioFramePosition
+    ) -> [String: Int] {
+        let beatDurationMicros = max(
+            0,
+            Int((Double(event.beatDurationFrames) * 1_000_000.0) / Double(sampleRate))
+        )
+        let elapsedFrames = max(0, virtualCurrentSample - event.sampleTime)
+        let elapsedMicros = min(
+            beatDurationMicros,
+            max(0, Int((Double(elapsedFrames) * 1_000_000.0) / Double(sampleRate)))
+        )
+
+        return [
+            "tick": event.tick,
+            "beatDurationMicros": beatDurationMicros,
+            "elapsedSinceBeatStartMicros": elapsedMicros,
+        ]
     }
 
     private func framesPerBeatCount() -> AVAudioFramePosition {
