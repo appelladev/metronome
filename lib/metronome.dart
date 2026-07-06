@@ -11,7 +11,7 @@ class Metronome {
     return _instance;
   }
   Metronome._internal();
-  final MetronomePlatform _platform = MetronomePlatform.instance;
+  MetronomePlatform get _platform => MetronomePlatform.instance;
   bool get isInitialized => _initialized;
   bool _initialized = false;
 

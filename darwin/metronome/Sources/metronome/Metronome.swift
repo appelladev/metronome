@@ -31,6 +31,8 @@ class Metronome {
 #if os(iOS)
     private var interruptionObserver: NSObjectProtocol?
     private var routeChangeObserver: NSObjectProtocol?
+    private var shouldResumeAfterInterruption: Bool = false
+    private var interruptionRecoveryWorkItem: DispatchWorkItem?
 #endif
     
     private struct BeatEvent {
@@ -74,9 +76,12 @@ class Metronome {
     }
     /// Start the metronome.
     func play() {
-        if isScheduling { return }
+        if isScheduling {
+            if audioEngine.isRunning && audioPlayerNode.isPlaying { return }
+            resetPlaybackStateForRestart()
+        }
 #if os(iOS)
-        activateAudioSession()
+        _ = activateAudioSession()
 #endif
         ensureAudioGraphReadyForPlayback()
         if !audioEngine.isRunning {
@@ -115,6 +120,10 @@ class Metronome {
         audioPlayerNode.reset()
         stopSchedulerPoller()
         stopTickPoller()
+        if audioEngine.isRunning {
+            audioEngine.stop()
+            audioEngine.reset()
+        }
         currentTick = 0
         beatQueueLock.sync {
             beatQueue.removeAll(keepingCapacity: true)
@@ -122,6 +131,11 @@ class Metronome {
         nextBeatSampleTime = 0
         hasSampleTimeAnchor = false
         sampleTimeOffset = 0
+#if os(iOS)
+        cancelInterruptionRecovery()
+        shouldResumeAfterInterruption = false
+        deactivateAudioSession()
+#endif
     }
     
     /// Set the BPM of the metronome.
@@ -186,7 +200,11 @@ class Metronome {
     
     func setVolume(volume: Float) {
         audioVolume = volume
+#if os(iOS)
+        applyEffectiveVolume()
+#else
         mixerNode.outputVolume = volume
+#endif
     }
     
     var isPlaying: Bool {
@@ -197,6 +215,7 @@ class Metronome {
     public func enableTickCallback(_eventTickSink: EventTickHandler) {
         self.eventTick = _eventTickSink
     }
+
 #if os(iOS)
     private func setupNotifications() {
         removeNotifications()
@@ -231,20 +250,22 @@ class Metronome {
         do {
             let audioSession = AVAudioSession.sharedInstance()
             try audioSession.setCategory(
-                .playAndRecord,
-                mode: .videoRecording,
-                options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker, .mixWithOthers]
+                .playback,
+                mode: .default,
+                options: [.mixWithOthers]
             )
         } catch {
             print("Failed to set audio session category: \(error)")
         }
     }
 
-    private func activateAudioSession() {
+    private func activateAudioSession() -> Bool {
         do {
             try AVAudioSession.sharedInstance().setActive(true)
+            return true
         } catch {
             print("Failed to activate audio session: \(error)")
+            return false
         }
     }
 
@@ -261,7 +282,7 @@ class Metronome {
             audioEngine.connect(audioPlayerNode, to: mixerNode, format: audioFileMain.processingFormat)
             isAudioGraphConfigured = true
         }
-        mixerNode.outputVolume = audioVolume
+        applyEffectiveVolume()
         audioEngine.prepare()
     }
 
@@ -277,16 +298,86 @@ class Metronome {
     }
 
     private func handleInterruption(_ notification: Notification) {
-        guard isPlaying,
-              let userInfo = notification.userInfo,
+        guard let userInfo = notification.userInfo,
               let interruptionTypeRaw = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
               let interruptionType = AVAudioSession.InterruptionType(rawValue: interruptionTypeRaw) else {
             return
         }
 
-        if interruptionType == .began {
-            pause()
+        switch interruptionType {
+        case .began:
+            cancelInterruptionRecovery()
+            shouldResumeAfterInterruption = isPlaying
+            suspendAudioForInterruption()
+        case .ended:
+            let optionsRaw = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
+            resumeAudioAfterInterruption(shouldResume: options.contains(.shouldResume))
+        @unknown default:
+            break
         }
+    }
+
+    private func applyEffectiveVolume() {
+        mixerNode.outputVolume = audioVolume
+    }
+
+    private func suspendAudioForInterruption() {
+        guard shouldResumeAfterInterruption else { return }
+        resetPlaybackStateForRestart()
+    }
+
+    private func resumeAudioAfterInterruption(shouldResume: Bool) {
+        guard shouldResumeAfterInterruption else { return }
+
+        if shouldResume {
+            resumeAudioAfterInterruptionIfAvailable()
+            return
+        }
+
+        scheduleInterruptionRecovery()
+    }
+
+    private func resumeAudioAfterInterruptionIfAvailable() {
+        guard shouldResumeAfterInterruption else {
+            cancelInterruptionRecovery()
+            return
+        }
+
+        configureAudioSessionCategory()
+        let didActivateAudioSession = activateAudioSession()
+        applyEffectiveVolume()
+        let isUnavailable = !didActivateAudioSession
+        if isUnavailable {
+            scheduleInterruptionRecovery()
+            return
+        }
+
+        cancelInterruptionRecovery()
+        resetPlaybackStateForRestart()
+        play()
+        if isScheduling {
+            shouldResumeAfterInterruption = false
+        } else {
+            scheduleInterruptionRecovery()
+        }
+    }
+
+    private func scheduleInterruptionRecovery() {
+        cancelInterruptionRecovery()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.resumeAudioAfterInterruptionIfAvailable()
+        }
+        interruptionRecoveryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.interruptionRecoveryRetryDelay,
+            execute: workItem
+        )
+    }
+
+    private func cancelInterruptionRecovery() {
+        interruptionRecoveryWorkItem?.cancel()
+        interruptionRecoveryWorkItem = nil
     }
 
     private func shouldRestartAfterRouteChange(_ notification: Notification) -> Bool {
@@ -332,6 +423,22 @@ class Metronome {
         }
     }
 #endif
+    private func resetPlaybackStateForRestart() {
+        stopSchedulerPoller()
+        stopTickPoller()
+        audioPlayerNode.stop()
+        audioPlayerNode.reset()
+        audioEngine.stop()
+        audioEngine.reset()
+        currentTick = 0
+        nextBeatSampleTime = 0
+        hasSampleTimeAnchor = false
+        sampleTimeOffset = 0
+        beatQueueLock.sync {
+            beatQueue.removeAll(keepingCapacity: true)
+        }
+    }
+
     private func prepareBeatBuffers() {
         audioFileMain.framePosition = 0
         audioFileAccented.framePosition = 0
@@ -407,14 +514,16 @@ class Metronome {
         let scheduleTime = AVAudioTime(sampleTime: scheduleSampleTime, atRate: Double(sampleRate))
         audioPlayerNode.scheduleBuffer(beatBuffer, at: scheduleTime, options: [], completionHandler: nil)
 
-        beatQueueLock.sync {
-            beatQueue.append(
-                BeatEvent(
-                    sampleTime: nextBeatSampleTime,
-                    beatDurationFrames: beatDurationFrames,
-                    tick: tickToPlay
+        if eventTick?.hasListener == true {
+            beatQueueLock.sync {
+                beatQueue.append(
+                    BeatEvent(
+                        sampleTime: nextBeatSampleTime,
+                        beatDurationFrames: beatDurationFrames,
+                        tick: tickToPlay
+                    )
                 )
-            )
+            }
         }
         nextBeatSampleTime += beatDurationFrames
 
@@ -428,6 +537,13 @@ class Metronome {
 
     private func startTickPoller() {
         tickPollTimer?.cancel()
+        guard eventTick?.hasListener == true else {
+            tickPollTimer = nil
+            beatQueueLock.sync {
+                beatQueue.removeAll(keepingCapacity: true)
+            }
+            return
+        }
         hasSampleTimeAnchor = false
         sampleTimeOffset = 0
         beatQueueLock.sync {
@@ -450,6 +566,13 @@ class Metronome {
     }
 
     private func pollTick() {
+        guard eventTick?.hasListener == true else {
+            stopTickPoller()
+            beatQueueLock.sync {
+                beatQueue.removeAll(keepingCapacity: true)
+            }
+            return
+        }
         guard isScheduling, audioEngine.isRunning else { return }
         guard let nodeTime = audioPlayerNode.lastRenderTime,
               let playerTime = audioPlayerNode.playerTime(forNodeTime: nodeTime) else { return }
@@ -531,6 +654,7 @@ class Metronome {
         stop()
 #if os(iOS)
         removeNotifications()
+        cancelInterruptionRecovery()
 #endif
 
         audioPlayerNode.reset()
@@ -554,6 +678,12 @@ class Metronome {
 #endif
     }
 }
+
+#if os(iOS)
+private extension Metronome {
+    static let interruptionRecoveryRetryDelay: TimeInterval = 0.4
+}
+#endif
 extension AVAudioFile {
     static func loadFromData(_ data: Data) throws -> (file: AVAudioFile, url: URL) {
         let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString + ".wav")

@@ -5,6 +5,10 @@ import FlutterMacOS
 #endif
 class EventTickHandler: NSObject,FlutterStreamHandler {
     private var eventSink: FlutterEventSink?
+
+    var hasListener: Bool {
+        return eventSink != nil
+    }
     
     public func send(res: Any){
         if let event = eventSink {

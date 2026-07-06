@@ -1,5 +1,7 @@
 package com.sumsg.metronome;
 
+import android.content.Context;
+
 import androidx.annotation.NonNull;
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.EventChannel;
@@ -20,12 +22,14 @@ public class MetronomePlugin implements FlutterPlugin, MethodCallHandler {
   //
   private EventChannel eventTick;
   private EventChannel.EventSink eventTickSink;
+  private Context applicationContext;
   // private final String TAG = "metronome";
   /// Metronome
   private Metronome metronome = null;
 
   @Override
   public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding) {
+    applicationContext = flutterPluginBinding.getApplicationContext();
     channel = new MethodChannel(flutterPluginBinding.getBinaryMessenger(), "metronome");
     channel.setMethodCallHandler(this);
     //
@@ -43,8 +47,12 @@ public class MetronomePlugin implements FlutterPlugin, MethodCallHandler {
       @Override
       public void onCancel(Object args) {
         eventTickSink = null;
+        if (metronome != null) {
+          metronome.enableTickCallback(null);
+        }
       }
     });
+
   }
 
   @Override
@@ -141,7 +149,14 @@ public class MetronomePlugin implements FlutterPlugin, MethodCallHandler {
     Integer sampleRateValue = call.argument("sampleRate");
     int sampleRate = (sampleRateValue != null) ? sampleRateValue : 44100;
 
-    metronome = new Metronome(mainFileBytes, accentedFileBytes, bpm, timeSignatureValue, volume, sampleRate);
+    metronome = new Metronome(
+        applicationContext,
+        mainFileBytes,
+        accentedFileBytes,
+        bpm,
+        timeSignatureValue,
+        volume,
+        sampleRate);
 
     if (enableTickCallback && eventTickSink != null) {
       metronome.enableTickCallback(eventTickSink);
